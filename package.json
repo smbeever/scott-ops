@@ -4,7 +4,7 @@
   "private": true,
   "description": "Scott's Personal Operations Dashboard — voice-first capture, one pane of glass over work, content, relationships, and personal stewardship",
   "engines": {
-    "node": ">=20.10.0",
+    "node": ">=22.10.0",
     "pnpm": ">=9"
   },
   "packageManager": "pnpm@11.2.2",
