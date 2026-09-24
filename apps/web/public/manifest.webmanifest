@@ -1,0 +1,46 @@
+{
+  "name": "Scott Ops",
+  "short_name": "Scott Ops",
+  "description": "Personal Operations Dashboard",
+  "start_url": "/today",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F6F2EA",
+  "theme_color": "#F6F2EA",
+  "categories": ["productivity"],
+  "shortcuts": [
+    {
+      "name": "Work",
+      "short_name": "Work",
+      "description": "Where everything stands — projects, domains, content",
+      "url": "/work"
+    }
+  ],
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

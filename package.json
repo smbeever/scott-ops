@@ -1,0 +1,30 @@
+{
+  "name": "scott-ops",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Scott's Personal Operations Dashboard — voice-first capture, one pane of glass over work, content, relationships, and personal stewardship",
+  "engines": {
+    "node": ">=20.10.0",
+    "pnpm": ">=9"
+  },
+  "packageManager": "pnpm@11.2.2",
+  "scripts": {
+    "dev:api": "pnpm --filter @scott-ops/api dev",
+    "dev:web": "pnpm --filter @scott-ops/web dev",
+    "build": "pnpm -r build",
+    "build:api": "pnpm --filter @scott-ops/api build",
+    "build:web": "pnpm --filter @scott-ops/web build",
+    "start:api": "pnpm --filter @scott-ops/api start",
+    "start:web": "pnpm --filter @scott-ops/web start",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "db:generate": "pnpm --filter @scott-ops/api drizzle:generate",
+    "db:push": "pnpm --filter @scott-ops/api drizzle:push",
+    "db:studio": "pnpm --filter @scott-ops/api drizzle:studio",
+    "import-notes": "pnpm --filter @scott-ops/api exec tsx scripts/import-notes.ts",
+    "smoke:prod": "node scripts/smoke-prod.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2"
+  }
+}

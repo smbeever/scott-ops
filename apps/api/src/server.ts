@@ -1,0 +1,119 @@
+import Fastify from 'fastify';
+import cookie from '@fastify/cookie';
+import cors from '@fastify/cors';
+import helmet from '@fastify/helmet';
+import multipart from '@fastify/multipart';
+import sensible from '@fastify/sensible';
+import { env, corsOrigins, isDev } from './lib/env.js';
+import authPlugin from './plugins/auth.js';
+import { healthzRoutes } from './routes/healthz.js';
+import { ingestRoutes } from './routes/ingest.js';
+import { inboundEmailRoutes, inboundEmailSettingsRoutes } from './routes/inbound-email.js';
+import { taskRoutes } from './routes/tasks.js';
+import { projectRoutes } from './routes/projects.js';
+import { domainRoutes } from './routes/domains.js';
+import { captureRoutes } from './routes/capture.js';
+import { googleAuthRoutes } from './routes/google-auth.js';
+import { calendarRoutes } from './routes/calendar.js';
+import { chatRoutes } from './routes/chat.js';
+import { notificationRoutes } from './routes/notifications.js';
+import { observationRoutes } from './routes/observations.js';
+import { cronRoutes } from './routes/cron.js';
+import { settingsRoutes } from './routes/settings.js';
+import { healthRoutes } from './routes/health.js';
+import { libraryRoutes } from './routes/library.js';
+import { contentRoutes } from './routes/content.js';
+import { searchRoutes } from './routes/search.js';
+import { peopleRoutes } from './routes/people.js';
+import { companyRoutes } from './routes/companies.js';
+import { conversationRoutes } from './routes/conversations.js';
+import { attentionRoutes } from './routes/attention.js';
+import { routineRoutes } from './routes/routines.js';
+import { uploadRoutes } from './routes/uploads.js';
+import { briefingRoutes } from './routes/briefing.js';
+import { widgetRoutes } from './routes/widget.js';
+import { dailyRuleRoutes } from './routes/daily-rule.js';
+import { workRoutes } from './routes/work.js';
+import { focusRoutes } from './routes/focus.js';
+
+export async function buildServer() {
+  const app = Fastify({
+    logger: {
+      level: env.LOG_LEVEL,
+      transport: isDev
+        ? { target: 'pino-pretty', options: { translateTime: 'HH:MM:ss.l', ignore: 'pid,hostname' } }
+        : undefined,
+    },
+    trustProxy: true,
+    disableRequestLogging: false,
+  });
+
+  await app.register(helmet, { contentSecurityPolicy: false });
+  await app.register(cors, {
+    origin: corsOrigins.length === 1 && corsOrigins[0] === '*' ? true : corsOrigins,
+    credentials: true,
+  });
+  await app.register(sensible);
+  await app.register(cookie);
+  await app.register(multipart, {
+    // Whisper's max upload is 25 MB. Cap matches.
+    // fieldSize default is 100 BYTES — silently truncates SendGrid Inbound
+    // Parse email bodies (which arrive as text fields, not files). Bump to
+    // 10 MB so real emails including quoted-reply threads survive intact.
+    limits: {
+      fileSize: 25 * 1024 * 1024,
+      fieldSize: 10 * 1024 * 1024,
+    },
+  });
+  await app.register(authPlugin);
+
+  await app.register(healthzRoutes);
+  await app.register(ingestRoutes);
+  await app.register(inboundEmailRoutes);
+  await app.register(inboundEmailSettingsRoutes);
+  await app.register(taskRoutes);
+  await app.register(projectRoutes);
+  await app.register(domainRoutes);
+  await app.register(captureRoutes);
+  await app.register(googleAuthRoutes);
+  await app.register(calendarRoutes);
+  await app.register(chatRoutes);
+  await app.register(notificationRoutes);
+  await app.register(observationRoutes);
+  await app.register(cronRoutes);
+  await app.register(libraryRoutes);
+  await app.register(contentRoutes);
+  await app.register(searchRoutes);
+  await app.register(peopleRoutes);
+  await app.register(companyRoutes);
+  await app.register(conversationRoutes);
+  await app.register(attentionRoutes);
+  await app.register(routineRoutes);
+  await app.register(uploadRoutes);
+  await app.register(settingsRoutes);
+  await app.register(healthRoutes);
+  await app.register(briefingRoutes);
+  await app.register(widgetRoutes);
+  await app.register(dailyRuleRoutes);
+  await app.register(workRoutes);
+  await app.register(focusRoutes);
+
+  app.get('/', async () => ({
+    name: 'scott-ops/api',
+    version: '0.1.0',
+    docs: 'See README.md',
+  }));
+
+  return app;
+}
+
+const isMainModule = import.meta.url === `file://${process.argv[1]}`;
+if (isMainModule) {
+  const app = await buildServer();
+  try {
+    await app.listen({ host: env.API_HOST, port: env.API_PORT });
+  } catch (err) {
+    app.log.fatal(err);
+    process.exit(1);
+  }
+}

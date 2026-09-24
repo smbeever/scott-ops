@@ -1,0 +1,85 @@
+import { z } from 'zod';
+
+// 'waiting' (Addendum 08) = blocked on someone else — not my move right now.
+export const TaskStatusSchema = z.enum(['open', 'waiting', 'done']);
+export const TaskSourceSchema = z.enum(['manual', 'voice', 'email', 'observation', 'import']);
+
+// Fields that can be explicitly cleared in updates need .nullable() —
+// .optional() alone only accepts undefined (omit the field). Sending null
+// clears it server-side.
+const nullableString = () => z.string().nullable().optional();
+const nullableDate = () => z.string().date().nullable().optional();
+
+export const TaskSchema = z.object({
+  id: z.string().uuid(),
+  title: z.string().min(1),
+  notes: nullableString(),
+  status: TaskStatusSchema,
+  // Waiting state (Addendum 08). waiting_since drives the aging day-count.
+  waiting_on: nullableString(),
+  waiting_since: nullableDate(),
+  due_date: nullableDate(),
+  due_time: nullableString(),
+  priority: z.number().int().min(1).max(4),
+  project_id: z.string().uuid().nullable().optional(),
+  domain_id: z.string().uuid(),
+  // Optional link to one of the project's milestones (Addendum 08 drill-in).
+  // Null = "General" (no milestone). Cleared server-side if it doesn't belong
+  // to the task's project.
+  milestone_id: z.string().uuid().nullable().optional(),
+  content_item_id: z.string().uuid().nullable().optional(),
+  parent_task_id: z.string().uuid().nullable().optional(),
+  recurrence_rule: nullableString(),
+  reminder_offsets: z.array(z.number()).default([]),
+  source: TaskSourceSchema,
+  top3_for_date: nullableDate(),
+  created_at: z.string().datetime({ offset: true }),
+  completed_at: z.string().datetime({ offset: true }).nullable().optional(),
+  updated_at: z.string().datetime({ offset: true }),
+  // Optional joins — present when API returns linked entity metadata.
+  project: z.object({
+    id: z.string().uuid(),
+    name: z.string(),
+    color: z.string().nullable().optional(),
+  }).nullable().optional(),
+  content_item: z.object({
+    id: z.string().uuid(),
+    title: z.string(),
+    type: z.string(),
+    status: z.string(),
+  }).nullable().optional(),
+  // Domain join — the tasks API selects stewardship_domains(id, name, is_system).
+  domain: z.object({
+    id: z.string().uuid(),
+    name: z.string(),
+    is_system: z.boolean().nullable().optional(),
+  }).nullable().optional(),
+});
+
+export const CreateTaskSchema = z.object({
+  title: z.string().min(1),
+  notes: nullableString(),
+  due_date: nullableDate(),
+  due_time: nullableString(),
+  priority: z.number().int().min(1).max(4).default(4),
+  project_id: z.string().uuid().nullable().optional(),
+  // domain_id is optional at the schema level so frictionless capture works
+  // (no domain picked → server defaults to Inbox). When project_id is set,
+  // the server overwrites domain_id with the project's domain. When both
+  // are passed explicitly and mismatched, the server returns 400.
+  domain_id: z.string().uuid().nullable().optional(),
+  // See TaskSchema.milestone_id. Server validates project ownership.
+  milestone_id: z.string().uuid().nullable().optional(),
+  content_item_id: z.string().uuid().nullable().optional(),
+  parent_task_id: z.string().uuid().nullable().optional(),
+  recurrence_rule: nullableString(),
+  reminder_offsets: z.array(z.number()).optional(),
+  source: TaskSourceSchema.default('manual'),
+  top3_for_date: nullableDate(),
+  waiting_on: nullableString(),
+  waiting_since: nullableDate(),
+});
+
+export const UpdateTaskSchema = CreateTaskSchema.partial().extend({
+  status: TaskStatusSchema.optional(),
+});

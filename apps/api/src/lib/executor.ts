@@ -1,0 +1,933 @@
+import type { SupabaseClient } from '@supabase/supabase-js';
+import type { ParsedAction } from './parser.js';
+import type { CaptureSource } from '@scott-ops/shared/schemas';
+import { INBOX_DOMAIN_ID } from '@scott-ops/shared';
+import {
+  matchProject, matchDomain, matchPerson, matchTask,
+  matchBook, matchContentItem, matchMilestone, matchQuote,
+  matchNote, matchJournalEntry, matchCompany,
+} from './match.js';
+import { insertEvent as insertGoogleEvent, loadTokens as loadGoogleTokens } from './google.js';
+import { getAppTz } from './app-settings.js';
+import { todayInTz, addDays } from './tz.js';
+import { clearAttentionForSource } from './attention.js';
+
+// Action executor — dispatch each parsed action to the right table.
+// Returns a per-action result so the client can confirm what happened.
+
+export interface ActionResult {
+  action: string;
+  status: 'success' | 'skipped' | 'failed';
+  message: string;
+  entity_id?: string;     // id of the row created/updated
+  entity_kind?: string;   // table name
+}
+
+// Per-invocation context threaded into each handler. We use this for
+// the `source` column on rows we create — different tables use
+// different vocabularies, so each handler picks the right value via
+// sourceFor() rather than the dispatcher choosing for it.
+export interface ExecuteOptions {
+  captureSource?: CaptureSource;       // 'voice' | 'text'; default 'voice'
+  // True when actions were parsed from an inbound email (Addendum 04).
+  // Overrides captureSource for the `source` column on tasks/activity_log
+  // and for `captured_via` on conversations.
+  emailForward?: boolean;
+  // Email metadata attached to any conversation created from an inbound
+  // email (Addendum 05). Carries dedup id + addresses + the Gmail deep-link,
+  // and — when the Sonnet summarizer ran (Phase 3) — the AI summary + a raw
+  // body excerpt + follow-up flags, which override the parser's verbatim
+  // summary on the conversation.
+  emailMeta?: {
+    email_message_id?: string | null;
+    from_address?: string | null;
+    to_addresses?: string[];
+    email_thread_id?: string | null;
+    email_deep_link?: string | null;
+    summary?: string | null;
+    body_excerpt?: string | null;
+    requires_followup?: boolean;
+    followup_by?: string | null;
+  };
+}
+
+// Map (captureSource, target table) → the value the table's CHECK
+// constraint actually accepts. tasks/activity_log use 'manual' for
+// typed input; journal_entries use 'typed'. Voice always maps to
+// 'voice' across all three. Email-forwarded actions get 'email' on
+// tables that accept it.
+type SourceColumnTable = 'tasks' | 'activity_log' | 'journal_entries';
+function sourceFor(
+  table: SourceColumnTable,
+  captureSource: CaptureSource | undefined,
+  emailForward = false,
+): string {
+  if (emailForward && table !== 'journal_entries') return 'email';
+  if (captureSource === 'text') {
+    return table === 'journal_entries' ? 'typed' : 'manual';
+  }
+  return 'voice';
+}
+
+// ─── Helper: read a string property without TypeScript indexing complaints ─
+const str = (a: ParsedAction, k: string): string | undefined => {
+  const v = a[k];
+  return typeof v === 'string' ? v : undefined;
+};
+const num = (a: ParsedAction, k: string): number | undefined => {
+  const v = a[k];
+  return typeof v === 'number' ? v : undefined;
+};
+// ─── One handler per action type ─────────────────────────────────────────
+
+async function createTask(
+  sb: SupabaseClient,
+  a: ParsedAction,
+  opts: ExecuteOptions = {},
+): Promise<ActionResult> {
+  const title = str(a, 'title');
+  if (!title) return { action: a.action, status: 'failed', message: 'missing_title' };
+
+  const project_id = await matchProject(sb, str(a, 'project_match'));
+  const parent_task_id = await matchTask(sb, str(a, 'parent_task_match'));
+
+  // Domain routing (Addendum 03). Three cases:
+  //   1. project_match resolved → use the project's domain
+  //   2. project_match unresolved but domain_match given → use that domain
+  //   3. Neither → fall through to Inbox
+  // We resolve domain_id here rather than letting the API endpoint do it
+  // because voice flows insert directly via the service-role client, not
+  // through /api/tasks. Keep the routing logic in one place: this function.
+  let domain_id: string;
+  if (project_id) {
+    const { data: project } = await sb
+      .from('projects')
+      .select('domain_id')
+      .eq('id', project_id)
+      .maybeSingle();
+    domain_id = (project?.domain_id as string | null) ?? INBOX_DOMAIN_ID;
+  } else {
+    const matchedDomain = await matchDomain(sb, str(a, 'domain_match'));
+    domain_id = matchedDomain ?? INBOX_DOMAIN_ID;
+  }
+
+  const insert: Record<string, unknown> = {
+    title,
+    priority: num(a, 'priority') ?? 4,
+    source: sourceFor('tasks', opts.captureSource, opts.emailForward),
+    domain_id,
+  };
+  if (str(a, 'notes')) insert.notes = str(a, 'notes');
+  if (str(a, 'due_date')) insert.due_date = str(a, 'due_date');
+  if (str(a, 'due_time')) insert.due_time = str(a, 'due_time');
+  if (project_id) insert.project_id = project_id;
+  if (parent_task_id) insert.parent_task_id = parent_task_id;
+  if (Array.isArray(a.reminder_offsets)) insert.reminder_offsets = a.reminder_offsets;
+
+  const { data, error } = await sb.from('tasks').insert(insert).select('id').single();
+  if (error) return { action: a.action, status: 'failed', message: error.message };
+
+  // Surface the routing decision in the user-facing message so the Today
+  // notification chip tells the user "landed in Inbox" vs "landed in Life"
+  // rather than just "Task created."
+  const landedInInbox = domain_id === INBOX_DOMAIN_ID;
+  const message = landedInInbox
+    ? `Task captured to Inbox: ${title}`
+    : `Task created: ${title}`;
+
+  return {
+    action: a.action,
+    status: 'success',
+    message,
+    entity_id: data.id,
+    entity_kind: 'tasks',
+  };
+}
+
+async function completeTask(sb: SupabaseClient, a: ParsedAction): Promise<ActionResult> {
+  const taskId = await matchTask(sb, str(a, 'task_match'));
+  if (!taskId) return { action: a.action, status: 'skipped', message: 'task_not_found' };
+  const { error } = await sb
+    .from('tasks')
+    .update({ status: 'done', completed_at: new Date().toISOString() })
+    .eq('id', taskId);
+  if (error) return { action: a.action, status: 'failed', message: error.message };
+  return {
+    action: a.action,
+    status: 'success',
+    message: 'Task marked done',
+    entity_id: taskId,
+    entity_kind: 'tasks',
+  };
+}
+
+async function createProject(sb: SupabaseClient, a: ParsedAction): Promise<ActionResult> {
+  const name = str(a, 'name');
+  if (!name) return { action: a.action, status: 'failed', message: 'missing_name' };
+  const domain_id = await matchDomain(sb, str(a, 'domain_match'));
+  const insert: Record<string, unknown> = { name };
+  if (domain_id) insert.domain_id = domain_id;
+  if (str(a, 'target_date')) insert.target_date = str(a, 'target_date');
+  const { data, error } = await sb.from('projects').insert(insert).select('id').single();
+  if (error) return { action: a.action, status: 'failed', message: error.message };
+  return { action: a.action, status: 'success', message: `Project created: ${name}`, entity_id: data.id, entity_kind: 'projects' };
+}
+
+async function updateProjectStatus(sb: SupabaseClient, a: ParsedAction): Promise<ActionResult> {
+  const id = await matchProject(sb, str(a, 'project_match'));
+  if (!id) return { action: a.action, status: 'skipped', message: 'project_not_found' };
+  const newStatus = str(a, 'status');
+  if (!newStatus) return { action: a.action, status: 'failed', message: 'missing_status' };
+  const update: Record<string, unknown> = { status: newStatus };
+  if (newStatus === 'done') update.completed_at = new Date().toISOString();
+  const { error } = await sb.from('projects').update(update).eq('id', id);
+  if (error) return { action: a.action, status: 'failed', message: error.message };
+  return { action: a.action, status: 'success', message: `Project status → ${newStatus}`, entity_id: id, entity_kind: 'projects' };
+}
+
+async function logActivity(
+  sb: SupabaseClient,
+  a: ParsedAction,
+  opts: ExecuteOptions = {},
+): Promise<ActionResult> {
+  const entry = str(a, 'entry');
+  if (!entry) return { action: a.action, status: 'failed', message: 'missing_entry' };
+  const project_id = await matchProject(sb, str(a, 'project_match'));
+  const hours = num(a, 'hours_logged');
+
+  const insert: Record<string, unknown> = { entry, source: sourceFor('activity_log', opts.captureSource, opts.emailForward) };
+  if (project_id) insert.project_id = project_id;
+  if (hours !== undefined) insert.hours_logged = hours;
+
+  const { data, error } = await sb.from('activity_log').insert(insert).select('id').single();
+  if (error) return { action: a.action, status: 'failed', message: error.message };
+
+  // Bump projects.hours_logged so the list view and project detail header
+  // reflect the new total. Read-then-update — there's no atomic increment
+  // RPC defined yet, and this user is the only writer so the race is
+  // effectively impossible.
+  if (project_id && hours !== undefined && hours > 0) {
+    const { data: row, error: readErr } = await sb
+      .from('projects')
+      .select('hours_logged')
+      .eq('id', project_id)
+      .single();
+    if (!readErr) {
+      const current = Number(row?.hours_logged ?? 0);
+      const { error: updateErr } = await sb
+        .from('projects')
+        .update({ hours_logged: current + hours })
+        .eq('id', project_id);
+      if (updateErr) {
+        // Activity row landed; project total didn't. Surface so the user
+        // knows the project widget will be off until next correction.
+        return {
+          action: a.action,
+          status: 'success',
+          message: `Activity logged (project hours update failed: ${updateErr.message})`,
+          entity_id: data.id,
+          entity_kind: 'activity_log',
+        };
+      }
+    }
+  }
+
+  // Voice-logged activity also clears the project's stalled attention item.
+  if (project_id) {
+    try {
+      await clearAttentionForSource(sb, 'project', project_id, ['project_stalled']);
+    } catch { /* best-effort */ }
+  }
+
+  return { action: a.action, status: 'success', message: 'Activity logged', entity_id: data.id, entity_kind: 'activity_log' };
+}
+
+async function updateMilestone(sb: SupabaseClient, a: ParsedAction): Promise<ActionResult> {
+  const projectId = await matchProject(sb, str(a, 'project_match'));
+  if (!projectId) return { action: a.action, status: 'skipped', message: 'project_not_found' };
+  const milestoneId = await matchMilestone(sb, projectId, str(a, 'milestone_match'));
+  if (!milestoneId) return { action: a.action, status: 'skipped', message: 'milestone_not_found' };
+  const update: Record<string, unknown> = {};
+  if (str(a, 'status')) update.status = str(a, 'status');
+  if (str(a, 'status') === 'done') update.completed_at = new Date().toISOString();
+  const { error } = await sb.from('milestones').update(update).eq('id', milestoneId);
+  if (error) return { action: a.action, status: 'failed', message: error.message };
+  return { action: a.action, status: 'success', message: 'Milestone updated', entity_id: milestoneId, entity_kind: 'milestones' };
+}
+
+async function createCalendarEvent(sb: SupabaseClient, a: ParsedAction): Promise<ActionResult> {
+  const title = str(a, 'title');
+  const start = str(a, 'start');
+  const end = str(a, 'end');
+  if (!title || !start || !end) return { action: a.action, status: 'failed', message: 'missing_required_fields' };
+
+  const insert: Record<string, unknown> = {
+    title, start_at: start, end_at: end,
+    source: 'created_here',
+  };
+  if (str(a, 'location')) insert.location = str(a, 'location');
+  if (Array.isArray(a.attendees)) insert.attendees = a.attendees;
+
+  // Push to Google Calendar first when connected, then mirror locally with
+  // the returned google_event_id so future pulls update (not duplicate) it.
+  // Status is explicit in the message so the user always knows whether the
+  // push happened: "(synced to Google)", "(local only — connect Google in
+  // Settings)", or "(Google push failed: ...)".
+  let pushedNote = '';
+  const googleTokens = await loadGoogleTokens().catch(() => null);
+  if (!googleTokens) {
+    pushedNote = ' (local only — connect Google in Settings)';
+  } else {
+    try {
+      const attendees = Array.isArray(a.attendees)
+        ? (a.attendees as unknown[]).filter((x): x is string => typeof x === 'string')
+        : undefined;
+      const googleEvent = await insertGoogleEvent({
+        summary: title,
+        start, end,
+        location: str(a, 'location'),
+        attendees,
+      });
+      if (googleEvent?.id) {
+        insert.google_event_id = googleEvent.id;
+        pushedNote = ' (synced to Google)';
+      } else {
+        pushedNote = ' (Google push returned no id)';
+      }
+    } catch (err) {
+      pushedNote = ` (Google push failed: ${err instanceof Error ? err.message : 'unknown'})`;
+    }
+  }
+
+  const { data, error } = await sb.from('calendar_events').insert(insert).select('id').single();
+  if (error) return { action: a.action, status: 'failed', message: error.message };
+  return {
+    action: a.action,
+    status: 'success',
+    message: `Calendar event created: ${title}${pushedNote}`,
+    entity_id: data.id,
+    entity_kind: 'calendar_events',
+  };
+}
+
+async function createNote(sb: SupabaseClient, a: ParsedAction): Promise<ActionResult> {
+  const body = str(a, 'body');
+  if (!body) return { action: a.action, status: 'failed', message: 'missing_body' };
+
+  // Resolve fuzzy references in parallel.
+  const [project_id, person_id, quote_id] = await Promise.all([
+    matchProject(sb, str(a, 'project_match')),
+    matchPerson(sb, str(a, 'person_match')),
+    matchQuote(sb, str(a, 'quote_match')),
+  ]);
+
+  const insert: Record<string, unknown> = {
+    body,
+    source_type: str(a, 'source_type') ?? 'own_thought',
+    needs_review: a.needs_review === true,
+  };
+  if (str(a, 'source_reference')) insert.source_reference = str(a, 'source_reference');
+  if (Array.isArray(a.tags)) insert.tags = a.tags;
+  if (project_id) insert.related_project_id = project_id;
+  if (person_id) insert.related_person_id = person_id;
+  if (quote_id) insert.related_quote_id = quote_id;
+
+  const { data, error } = await sb.from('notes').insert(insert).select('id').single();
+  if (error) return { action: a.action, status: 'failed', message: error.message };
+
+  // Short success message — reflects the resolved source_type so the
+  // notification feed is informative ("Reading response saved" vs just
+  // "Note saved").
+  const labels: Record<string, string> = {
+    own_thought: 'Note saved',
+    reading_response: 'Reading response saved',
+    meeting_note: 'Meeting note saved',
+    brainstorm: 'Brainstorm saved',
+    observation: 'Observation note saved',
+    other: 'Note saved',
+  };
+  const label = labels[insert.source_type as string] ?? 'Note saved';
+  const reviewSuffix = insert.needs_review ? ' (needs review)' : '';
+
+  return {
+    action: a.action,
+    status: 'success',
+    message: `${label}${reviewSuffix}`,
+    entity_id: data.id,
+    entity_kind: 'notes',
+  };
+}
+
+async function createQuote(sb: SupabaseClient, a: ParsedAction): Promise<ActionResult> {
+  const text = str(a, 'text');
+  if (!text) return { action: a.action, status: 'failed', message: 'missing_text' };
+
+  const book_id = await matchBook(sb, str(a, 'book_match'));
+  const insert: Record<string, unknown> = { text, added_via: 'voice' };
+  if (book_id) insert.book_id = book_id;
+  if (num(a, 'page_number')) insert.page_number = num(a, 'page_number');
+  if (str(a, 'chapter')) insert.chapter = str(a, 'chapter');
+  if (str(a, 'source_type')) insert.source_type = str(a, 'source_type');
+  if (str(a, 'source_reference')) insert.source_reference = str(a, 'source_reference');
+  if (str(a, 'source_url')) insert.source_url = str(a, 'source_url');
+  if (str(a, 'source_author')) insert.source_author = str(a, 'source_author');
+  if (Array.isArray(a.tags)) insert.tags = a.tags;
+
+  const { data, error } = await sb.from('quotes').insert(insert).select('id').single();
+  if (error) return { action: a.action, status: 'failed', message: error.message };
+
+  // Addendum 02 §4 — if the user bundled a thought with the quote in the
+  // same utterance, the parser includes `annotation_body`. Write the
+  // annotation alongside the quote with context='on_capture'.
+  const annotationBody = str(a, 'annotation_body');
+  let annotationNote = '';
+  if (annotationBody) {
+    const { error: annoErr } = await sb.from('quote_annotations').insert({
+      quote_id: data.id,
+      body: annotationBody,
+      context: 'on_capture',
+    });
+    if (annoErr) {
+      annotationNote = ` (annotation failed: ${annoErr.message})`;
+    } else {
+      annotationNote = ' with your thought';
+    }
+  }
+
+  return {
+    action: a.action,
+    status: 'success',
+    message: `Quote saved${annotationNote}`,
+    entity_id: data.id,
+    entity_kind: 'quotes',
+  };
+}
+
+async function createQuoteAnnotation(sb: SupabaseClient, a: ParsedAction): Promise<ActionResult> {
+  const body = str(a, 'body');
+  if (!body) return { action: a.action, status: 'failed', message: 'missing_body' };
+  const quote_id = await matchQuote(sb, str(a, 'quote_match'));
+  if (!quote_id) return { action: a.action, status: 'skipped', message: 'quote_not_found' };
+
+  const insert: Record<string, unknown> = {
+    quote_id,
+    body,
+    context: str(a, 'context') ?? 'on_revisit',
+  };
+  if (Array.isArray(a.tags)) insert.tags = a.tags;
+
+  const { data, error } = await sb.from('quote_annotations').insert(insert).select('id').single();
+  if (error) return { action: a.action, status: 'failed', message: error.message };
+  return {
+    action: a.action,
+    status: 'success',
+    message: 'Annotation added to quote',
+    entity_id: data.id,
+    entity_kind: 'quote_annotations',
+  };
+}
+
+async function createJournalEntry(
+  sb: SupabaseClient,
+  a: ParsedAction,
+  opts: ExecuteOptions = {},
+): Promise<ActionResult> {
+  const text = str(a, 'text');
+  if (!text) return { action: a.action, status: 'failed', message: 'missing_text' };
+  const insert: Record<string, unknown> = {
+    transcription_text: text,
+    source: sourceFor('journal_entries', opts.captureSource, opts.emailForward),
+    entry_date: str(a, 'date') ?? new Intl.DateTimeFormat('en-CA', {
+      timeZone: await getAppTz(), year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date()),
+  };
+  const { data, error } = await sb.from('journal_entries').insert(insert).select('id').single();
+  if (error) return { action: a.action, status: 'failed', message: error.message };
+  return { action: a.action, status: 'success', message: 'Journal entry saved', entity_id: data.id, entity_kind: 'journal_entries' };
+}
+
+// captured_via for a conversation given the invocation context.
+function conversationCapturedVia(opts: ExecuteOptions): string {
+  if (opts.emailForward) return 'email_forward';
+  if (opts.captureSource === 'voice') return 'voice';
+  return 'manual';
+}
+
+// Insert a conversation row with email-message-id dedup. Shared by both the
+// legacy create_person_interaction path and the new create_conversation path
+// so there is exactly ONE write path into the conversations table.
+async function insertConversation(
+  sb: SupabaseClient,
+  fields: {
+    company_id?: string | null;
+    person_id?: string | null;
+    project_id?: string | null;
+    task_id?: string | null;
+    interaction_type: string;
+    direction: string;
+    subject?: string | null;
+    summary: string;
+    body_excerpt?: string | null;
+    email_message_id?: string | null;
+    from_address?: string | null;
+    to_addresses?: string[];
+    email_thread_id?: string | null;
+    email_deep_link?: string | null;
+    requires_followup?: boolean;
+    followup_by?: string | null;
+    occurred_at?: string | null;
+    captured_via: string;
+  },
+  actionLabel: string,
+): Promise<ActionResult> {
+  // Must relate to at least one entity (mirrors the DB CHECK).
+  if (!fields.company_id && !fields.person_id && !fields.project_id && !fields.task_id) {
+    return { action: actionLabel, status: 'skipped', message: 'no_association_resolved' };
+  }
+  // Dedup on email_message_id so a re-forwarded email can't create two rows.
+  if (fields.email_message_id) {
+    const { data: existing } = await sb
+      .from('conversations')
+      .select('id')
+      .eq('email_message_id', fields.email_message_id)
+      .maybeSingle();
+    if (existing) {
+      return {
+        action: actionLabel,
+        status: 'skipped',
+        message: 'duplicate_email_message_id',
+        entity_id: existing.id,
+        entity_kind: 'conversations',
+      };
+    }
+  }
+
+  const insert: Record<string, unknown> = {
+    interaction_type: fields.interaction_type,
+    direction: fields.direction,
+    summary: fields.summary,
+    captured_via: fields.captured_via,
+    requires_followup: fields.requires_followup === true,
+  };
+  if (fields.company_id) insert.company_id = fields.company_id;
+  if (fields.person_id) insert.person_id = fields.person_id;
+  if (fields.project_id) insert.project_id = fields.project_id;
+  if (fields.task_id) insert.task_id = fields.task_id;
+  if (fields.subject) insert.subject = fields.subject;
+  if (fields.body_excerpt) insert.body_excerpt = fields.body_excerpt;
+  if (fields.email_message_id) insert.email_message_id = fields.email_message_id;
+  if (fields.from_address) insert.from_address = fields.from_address;
+  if (fields.to_addresses && fields.to_addresses.length) insert.to_addresses = fields.to_addresses;
+  if (fields.email_thread_id) insert.email_thread_id = fields.email_thread_id;
+  if (fields.email_deep_link) insert.email_deep_link = fields.email_deep_link;
+  if (fields.followup_by) insert.followup_by = fields.followup_by;
+  if (fields.occurred_at) insert.occurred_at = fields.occurred_at;
+
+  const { data, error } = await sb.from('conversations').insert(insert).select('id').single();
+  if (error) return { action: actionLabel, status: 'failed', message: error.message };
+  // Logging a conversation with a company clears its silent-client attention
+  // item live (voice/email path). Best-effort.
+  if (fields.company_id) {
+    try {
+      await clearAttentionForSource(sb, 'company', fields.company_id, ['company_silent']);
+    } catch { /* best-effort */ }
+  }
+  return {
+    action: actionLabel,
+    status: 'success',
+    message: 'Conversation logged',
+    entity_id: data.id,
+    entity_kind: 'conversations',
+  };
+}
+
+// Legacy create_person_interaction (Addendum 04) — now writes a conversation
+// so there's a single interaction table. Maps body → summary, 'text' → the
+// conversations enum, etc.
+async function createPersonInteraction(
+  sb: SupabaseClient,
+  a: ParsedAction,
+  opts: ExecuteOptions = {},
+): Promise<ActionResult> {
+  const person_id = await matchPerson(sb, str(a, 'person_match'));
+  if (!person_id) return { action: a.action, status: 'skipped', message: 'person_not_found' };
+  const body = str(a, 'body') ?? str(a, 'notes');
+  if (!body) return { action: a.action, status: 'failed', message: 'missing_body' };
+  const rawType = str(a, 'interaction_type') ?? 'email';
+  const interaction_type = rawType === 'text' ? 'text_message' : rawType;
+  return insertConversation(
+    sb,
+    {
+      person_id,
+      interaction_type,
+      direction: str(a, 'direction') ?? 'inbound',
+      subject: str(a, 'subject') ?? null,
+      summary: body,
+      body_excerpt: body,
+      // Email metadata (dedup id + addresses) comes from the inbound-email
+      // pipeline via opts, not the parser. Falls back to any inline field.
+      email_message_id: opts.emailMeta?.email_message_id ?? str(a, 'email_message_id') ?? null,
+      from_address: opts.emailMeta?.from_address ?? null,
+      to_addresses: opts.emailMeta?.to_addresses,
+      email_thread_id: opts.emailMeta?.email_thread_id ?? null,
+      email_deep_link: opts.emailMeta?.email_deep_link ?? null,
+      occurred_at: str(a, 'occurred_at') ?? null,
+      captured_via: conversationCapturedVia(opts),
+    },
+    a.action,
+  );
+}
+
+// New create_conversation (Addendum 05) — resolves company/person/project
+// match phrases and logs a conversation.
+async function createConversation(
+  sb: SupabaseClient,
+  a: ParsedAction,
+  opts: ExecuteOptions = {},
+): Promise<ActionResult> {
+  const [company_id, person_id, project_id] = await Promise.all([
+    matchCompany(sb, str(a, 'company_match')),
+    matchPerson(sb, str(a, 'person_match')),
+    matchProject(sb, str(a, 'project_match')),
+  ]);
+  // For email captures the Sonnet summarizer (Phase 3) supplies the summary +
+  // follow-up flags; prefer those over the parser's verbatim body. Falls back
+  // to the parser's summary when the summarizer didn't run.
+  const summary = opts.emailMeta?.summary ?? str(a, 'summary');
+  if (!summary) return { action: a.action, status: 'failed', message: 'missing_summary' };
+  const requires_followup = opts.emailMeta
+    ? opts.emailMeta.requires_followup === true
+    : a.requires_followup === true;
+  const followup_by = opts.emailMeta
+    ? (opts.emailMeta.followup_by ?? null)
+    : (str(a, 'followup_by') ?? null);
+  return insertConversation(
+    sb,
+    {
+      company_id,
+      person_id,
+      project_id,
+      interaction_type: str(a, 'interaction_type') ?? 'other',
+      direction: str(a, 'direction') ?? 'internal',
+      subject: str(a, 'subject') ?? null,
+      summary,
+      body_excerpt: opts.emailMeta?.body_excerpt ?? (opts.emailMeta ? summary : null),
+      email_message_id: opts.emailMeta?.email_message_id ?? null,
+      from_address: opts.emailMeta?.from_address ?? null,
+      to_addresses: opts.emailMeta?.to_addresses,
+      email_thread_id: opts.emailMeta?.email_thread_id ?? null,
+      email_deep_link: opts.emailMeta?.email_deep_link ?? null,
+      requires_followup,
+      followup_by,
+      occurred_at: str(a, 'occurred_at') ?? null,
+      captured_via: conversationCapturedVia(opts),
+    },
+    a.action,
+  );
+}
+
+// create_company (Addendum 05).
+async function createCompany(sb: SupabaseClient, a: ParsedAction): Promise<ActionResult> {
+  const name = str(a, 'name');
+  if (!name) return { action: a.action, status: 'failed', message: 'missing_name' };
+  const domain_id = await matchDomain(sb, str(a, 'domain_match'));
+  const insert: Record<string, unknown> = { name };
+  if (domain_id) insert.domain_id = domain_id;
+  if (str(a, 'relationship_type')) insert.relationship_type = str(a, 'relationship_type');
+  if (str(a, 'website')) insert.website = str(a, 'website');
+  if (str(a, 'primary_email')) insert.primary_email = str(a, 'primary_email');
+  const { data, error } = await sb.from('companies').insert(insert).select('id').single();
+  if (error) {
+    // Duplicate name → treat as "already exists", surface the existing row.
+    if (error.code === '23505') {
+      const existing = await matchCompany(sb, name);
+      return {
+        action: a.action,
+        status: 'skipped',
+        message: 'company_already_exists',
+        entity_id: existing ?? undefined,
+        entity_kind: 'companies',
+      };
+    }
+    return { action: a.action, status: 'failed', message: error.message };
+  }
+  return { action: a.action, status: 'success', message: `Company created: ${name}`, entity_id: data.id, entity_kind: 'companies' };
+}
+
+async function createPersonFact(sb: SupabaseClient, a: ParsedAction): Promise<ActionResult> {
+  const person_id = await matchPerson(sb, str(a, 'person_match'));
+  if (!person_id) return { action: a.action, status: 'skipped', message: 'person_not_found' };
+  const fact_value = str(a, 'fact_value');
+  if (!fact_value) return { action: a.action, status: 'failed', message: 'missing_fact_value' };
+  const insert: Record<string, unknown> = {
+    person_id, fact_value,
+    fact_type: str(a, 'fact_type') ?? 'other',
+    recurring: a.recurring === true,
+  };
+  if (str(a, 'date_relevant')) insert.date_relevant = str(a, 'date_relevant');
+  const { data, error } = await sb.from('person_facts').insert(insert).select('id').single();
+  if (error) return { action: a.action, status: 'failed', message: error.message };
+  return { action: a.action, status: 'success', message: 'Person fact saved', entity_id: data.id, entity_kind: 'person_facts' };
+}
+
+async function updateContentItem(sb: SupabaseClient, a: ParsedAction): Promise<ActionResult> {
+  const id = await matchContentItem(sb, str(a, 'item_match'));
+  if (!id) return { action: a.action, status: 'skipped', message: 'item_not_found' };
+  const update: Record<string, unknown> = {};
+  if (str(a, 'status')) update.status = str(a, 'status');
+  if (str(a, 'type')) update.type = str(a, 'type');
+  if (str(a, 'video_url')) update.video_url = str(a, 'video_url');
+  if (str(a, 'outline_md')) update.outline_md = str(a, 'outline_md');
+  if (Object.keys(update).length === 0) {
+    return { action: a.action, status: 'skipped', message: 'nothing_to_update' };
+  }
+  const { error } = await sb.from('content_items').update(update).eq('id', id);
+  if (error) return { action: a.action, status: 'failed', message: error.message };
+  return { action: a.action, status: 'success', message: 'Content item updated', entity_id: id, entity_kind: 'content_items' };
+}
+
+// Resurface weight — "boost the Cal Newport quote about focus", "exclude
+// this from resurfacing", "5x the gratitude journal from Tuesday". The
+// parser emits the canonical numeric weight; we just route by kind and
+// fuzzy-match the target. Anything other than the four supported weights
+// (0 / 1 / 2 / 5) is treated as a request for the nearest one.
+async function setResurfaceWeight(sb: SupabaseClient, a: ParsedAction): Promise<ActionResult> {
+  const kind = str(a, 'target_kind');
+  const matchPhrase = str(a, 'target_match');
+  const rawWeight = num(a, 'weight');
+  if (!kind || !['quote', 'note', 'journal'].includes(kind)) {
+    return { action: a.action, status: 'failed', message: 'missing_or_invalid_target_kind' };
+  }
+  if (!matchPhrase) {
+    return { action: a.action, status: 'failed', message: 'missing_target_match' };
+  }
+  if (rawWeight === undefined) {
+    return { action: a.action, status: 'failed', message: 'missing_weight' };
+  }
+  // Snap to the supported cycle. The UI only ever sets {0,1,2,5}; arbitrary
+  // weights work in the DB but the user can never put them back through the
+  // UI again. Snapping keeps the system uniform.
+  const weight = [0, 1, 2, 5].reduce((closest, w) =>
+    Math.abs(w - rawWeight) < Math.abs(closest - rawWeight) ? w : closest, 1);
+
+  const table = kind === 'quote' ? 'quotes' : kind === 'note' ? 'notes' : 'journal_entries';
+  const matcher =
+    kind === 'quote' ? matchQuote :
+    kind === 'note' ? matchNote :
+    matchJournalEntry;
+  const id = await matcher(sb, matchPhrase);
+  if (!id) return { action: a.action, status: 'skipped', message: `${kind}_not_found` };
+
+  const { error } = await sb.from(table).update({ resurface_weight: weight }).eq('id', id);
+  if (error) return { action: a.action, status: 'failed', message: error.message };
+
+  const label =
+    weight === 0 ? 'excluded from resurfacing' :
+    weight === 1 ? 'reset to normal' :
+    `boosted ${weight}×`;
+  return {
+    action: a.action,
+    status: 'success',
+    message: `${kind[0]!.toUpperCase() + kind.slice(1)} ${label}`,
+    entity_id: id,
+    entity_kind: table,
+  };
+}
+
+async function addInventoryItem(sb: SupabaseClient, a: ParsedAction): Promise<ActionResult> {
+  const category = str(a, 'category');
+  if (!category) return { action: a.action, status: 'failed', message: 'missing_category' };
+  const insert: Record<string, unknown> = { category };
+  if (str(a, 'brand')) insert.brand = str(a, 'brand');
+  if (str(a, 'model')) insert.model = str(a, 'model');
+  if (str(a, 'serial')) insert.serial_number = str(a, 'serial');
+  if (str(a, 'purchase_date')) insert.purchase_date = str(a, 'purchase_date');
+  if (num(a, 'purchase_price') !== undefined) insert.purchase_price = num(a, 'purchase_price');
+  const { data, error } = await sb.from('inventory_items').insert(insert).select('id').single();
+  if (error) return { action: a.action, status: 'failed', message: error.message };
+  return { action: a.action, status: 'success', message: 'Inventory item added', entity_id: data.id, entity_kind: 'inventory_items' };
+}
+
+// ─── Tomorrow's Focus (Addendum 09) ──────────────────────────────────────
+
+// Point a day at a project or content item, in one sentence. Replaces the
+// retired score_day / set_keystone / log_hedge actions.
+//
+// Match order is project-then-content: "tomorrow's focus is the Acme redesign"
+// resolves the project, and "tomorrow I'm filming Episode 4" falls through to
+// the content item. daily_focus is keyed by date (upsert), so saying it twice
+// just replaces the pick — and there is nothing to score, so no entity_id.
+async function setFocus(sb: SupabaseClient, a: ParsedAction): Promise<ActionResult> {
+  const match = str(a, 'target_match');
+  if (!match) return { action: a.action, status: 'skipped', message: 'target_required' };
+
+  const tz = await getAppTz();
+  const when = str(a, 'date') === 'today' ? todayInTz(tz) : addDays(todayInTz(tz), 1);
+
+  let targetType: 'project' | 'content_item' = 'project';
+  let targetId = await matchProject(sb, match);
+  if (!targetId) {
+    targetId = await matchContentItem(sb, match);
+    targetType = 'content_item';
+  }
+  if (!targetId) return { action: a.action, status: 'skipped', message: 'target_not_found' };
+
+  const { error } = await sb.from('daily_focus').upsert(
+    {
+      date: when,
+      target_type: targetType,
+      target_id: targetId,
+      note: str(a, 'note') ?? null,
+    },
+    { onConflict: 'date' },
+  );
+  if (error) return { action: a.action, status: 'failed', message: error.message };
+  return { action: a.action, status: 'success', message: `Focus set for ${when}` };
+}
+
+// ─── Dispatcher ──────────────────────────────────────────────────────────
+
+// Handlers may optionally accept ExecuteOptions for per-invocation
+// metadata (currently just captureSource). Handlers that don't care
+// can ignore the third arg.
+type Handler = (sb: SupabaseClient, a: ParsedAction, opts?: ExecuteOptions) => Promise<ActionResult>;
+type HandlerMap = Record<string, Handler>;
+
+const handlers: HandlerMap = {
+  create_task: createTask,
+  complete_task: completeTask,
+  create_project: createProject,
+  update_project_status: updateProjectStatus,
+  log_activity: logActivity,
+  update_milestone: updateMilestone,
+  create_calendar_event: createCalendarEvent,
+  create_note: createNote,
+  create_quote: createQuote,
+  create_quote_annotation: createQuoteAnnotation,
+  create_journal_entry: createJournalEntry,
+  create_person_fact: createPersonFact,
+  create_person_interaction: createPersonInteraction,
+  create_conversation: createConversation,
+  create_company: createCompany,
+  update_content_item: updateContentItem,
+  add_inventory_item: addInventoryItem,
+  set_resurface_weight: setResurfaceWeight,
+  set_focus: setFocus,
+};
+
+// ─── Notification writers ───────────────────────────────────────────────
+
+// Map entity_kind → URL path for click-through. Add to this as new
+// entity types ship.
+const DRILL_URL: Record<string, string> = {
+  tasks: '/tasks',
+  projects: '/projects',
+  milestones: '/projects', // no detail page yet — go to parent project
+  activity_log: '/projects',
+  calendar_events: '/calendar',
+  notes: '/library/notes',
+  quotes: '/library/quotes',
+  quote_annotations: '/library/quotes', // parent quote
+  journal_entries: '/library/journal',
+  person_facts: '/people',
+  person_interactions: '/people',
+  conversations: '/people',
+  companies: '/companies',
+  content_items: '/content',
+  inventory_items: '/library/inventory',
+};
+
+const ACTION_TITLE: Record<string, string> = {
+  create_task: 'Task created',
+  complete_task: 'Task completed',
+  create_project: 'Project created',
+  update_project_status: 'Project status changed',
+  log_activity: 'Activity logged',
+  update_milestone: 'Milestone updated',
+  create_calendar_event: 'Event scheduled',
+  create_note: 'Note saved',
+  create_quote: 'Quote saved',
+  create_quote_annotation: 'Annotation added',
+  create_journal_entry: 'Journal entry saved',
+  create_person_fact: 'Person fact saved',
+  create_person_interaction: 'Conversation logged',
+  create_conversation: 'Conversation logged',
+  create_company: 'Company created',
+  update_content_item: 'Content item updated',
+  add_inventory_item: 'Inventory item added',
+  set_resurface_weight: 'Resurface weight updated',
+  set_focus: 'Focus set',
+};
+
+async function recordNotification(
+  sb: SupabaseClient,
+  action: ParsedAction,
+  result: ActionResult,
+): Promise<void> {
+  // We log every action — success and failure. Failures get a 'concerning'
+  // tone the UI can highlight. Skipped (e.g. fuzzy match miss) also lands
+  // here so the user knows why something didn't happen.
+  const title = ACTION_TITLE[action.action] ?? action.action;
+  const type =
+    result.status === 'success' ? 'voice_action'
+    : result.status === 'skipped' ? 'voice_action_skipped'
+    : 'voice_action_failed';
+
+  let source_url: string | null = null;
+  if (result.entity_id && result.entity_kind && DRILL_URL[result.entity_kind]) {
+    source_url = `${DRILL_URL[result.entity_kind]}/${result.entity_id}`;
+    // Some entity kinds don't have a /:id page yet. For those, drop to the
+    // parent path. (DRILL_URL[milestones] = '/projects' which lands on the
+    // list — better than a broken link.)
+    if (['milestones', 'activity_log', 'notes', 'quotes', 'journal_entries',
+         'person_facts', 'person_interactions', 'conversations', 'content_items',
+         'inventory_items', 'calendar_events'].includes(result.entity_kind)) {
+      source_url = DRILL_URL[result.entity_kind]!;
+    }
+  }
+
+  await sb.from('notifications').insert({
+    type,
+    title,
+    body: result.message,
+    source_ref: result.entity_id ?? null,
+    source_url,
+    status: 'unread',
+  });
+}
+
+// ─── Executor ───────────────────────────────────────────────────────────
+
+export async function executeActions(
+  sb: SupabaseClient,
+  actions: ParsedAction[],
+  opts: ExecuteOptions = {},
+): Promise<ActionResult[]> {
+  const results: ActionResult[] = [];
+  for (const a of actions) {
+    const handler = handlers[a.action];
+    let result: ActionResult;
+    if (!handler) {
+      result = { action: a.action, status: 'failed', message: 'unknown_action_type' };
+    } else {
+      try {
+        result = await handler(sb, a, opts);
+      } catch (err) {
+        result = {
+          action: a.action,
+          status: 'failed',
+          message: err instanceof Error ? err.message : 'unknown_error',
+        };
+      }
+    }
+    results.push(result);
+
+    // Notification write is best-effort — never block the action result.
+    try {
+      await recordNotification(sb, a, result);
+    } catch {
+      /* swallow — observability matters less than the action itself */
+    }
+  }
+  return results;
+}
